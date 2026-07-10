@@ -43,3 +43,11 @@ resource "azurerm_key_vault_secret" "ssh_private_key" {
   }
 }
 
+module "automation" {
+  source              = "../modules/automation"
+  prefix              = local.prefix
+  location            = var.location
+  resource_group_name = azurerm_resource_group.rg_main.name
+  tags                = local.common_tags
+  vm_name             = module.vm.vm_name
+}
