@@ -167,3 +167,119 @@ stages:
                       workingDirectory: $(workingDirectory)
                       environmentServiceNameAzureRM: 'service_connection'
                       commandOptions: '$(Pipeline.Workspace)/tfplan/tfplan'
+
+                  - task: AzureCLI@2
+                    displayName: 'Export Terraform outputs'
+                    inputs:
+                      connectedServiceNameARM: 'service_connection'
+                      scriptType: 'bash'
+                      scriptLocation: 'inlineScript'
+                      inlineScript: |
+                        cd $(workingDirectory)
+                        terraform output -json > $(Pipeline.Workspace)/tf-outputs.json
+                        echo "Wrote outputs:"
+                        cat $(Pipeline.Workspace)/tf-outputs.json
+
+                  - task: PublishPipelineArtifact@1
+                    displayName: 'Publish Terraform outputs'
+                    inputs:
+                      targetPath: '$(Pipeline.Workspace)/tf-outputs.json'
+                      artifactName: 'tf-outputs'
+
+  - stage: Ansible
+    displayName: 'Configure VM with Ansible'
+    dependsOn: Apply
+    condition: succeeded()
+    jobs:
+      - job: Ansible
+        displayName: 'Run Ansible Playbook'
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Terraform outputs'
+            inputs:
+              artifactName: 'tf-outputs'
+              targetPath: '$(Pipeline.Workspace)'
+
+          - bash: |
+              OUTPUTS=$(Pipeline.Workspace)/tf-outputs.json
+              RG=$(jq -r '.resource_group_name.value' $OUTPUTS)
+              VMIP=$(jq -r '.vm_public_ip.value' $OUTPUTS)
+              NSG=$(jq -r '.nsg_name.value' $OUTPUTS)
+              KV=$(jq -r '.key_vault_name.value' $OUTPUTS)
+
+              if [ -z "$RG" ] || [ -z "$VMIP" ] || [ -z "$NSG" ] || [ -z "$KV" ]; then
+                echo "ERROR: one or more outputs empty. RG=$RG VMIP=$VMIP NSG=$NSG KV=$KV"
+                exit 1
+              fi
+
+              echo "##vso[task.setvariable variable=rgName]$RG"
+              echo "##vso[task.setvariable variable=vmPublicIp]$VMIP"
+              echo "##vso[task.setvariable variable=nsgName]$NSG"
+              echo "##vso[task.setvariable variable=kvName]$KV"
+            displayName: 'Parse Terraform outputs'
+
+          - task: AzureCLI@3
+            displayName: 'Open NSG for agent IP'
+            inputs:
+              connectedServiceNameARM: 'service_connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                AGENT_IP=$(curl -s ifconfig.me)
+                echo "##vso[task.setvariable variable=agentIp]$AGENT_IP"
+                az network nsg rule create \
+                  --resource-group $(rgName) \
+                  --nsg-name $(nsgName) \
+                  --name AllowPipelineSSH-$(Build.BuildId) \
+                  --priority 100 \
+                  --direction Inbound --access Allow --protocol Tcp \
+                  --destination-port-ranges 22 \
+                  --source-address-prefixes ${AGENT_IP}/32 \
+                  --destination-address-prefixes '*'
+
+          - task: AzureCLI@3
+            displayName: 'Pull SSH key and write inventory'
+            inputs:
+              connectedServiceNameARM: 'service_connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                mkdir -p ~/.ssh
+                az keyvault secret show --vault-name $(kvName) \
+                  --name vm-ssh-private-key --query value -o tsv > ~/.ssh/vm-key.pem
+                chmod 600 ~/.ssh/vm-key.pem
+                cat > $(Build.SourcesDirectory)/ansible/inventory.ini <<EOF
+                [web]
+                dev-vm ansible_host=$(vmPublicIp)
+
+                [web:vars]
+                ansible_user=azureuser
+                ansible_ssh_private_key_file=~/.ssh/vm-key.pem
+                ansible_python_interpreter=/usr/bin/python3
+                ansible_ssh_common_args='-o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no'
+                EOF
+
+          - bash: |
+              sudo apt-get update && sudo apt-get install -y ansible
+              ansible-galaxy collection install community.general
+            displayName: Install Ansible
+
+          - bash: |
+              cd $(Build.SourcesDirectory)/ansible
+              ansible-playbook -i inventory.ini playbook.yml
+            displayName: Run playbook
+
+          - task: AzureCLI@3
+            displayName: 'Close NSG rule'
+            condition: always()
+            inputs:
+              connectedServiceNameARM: 'service_connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az network nsg rule delete \
+                  --resource-group $(rgName) \
+                  --nsg-name $(nsgName) \
+                  --name AllowPipelineSSH-$(Build.BuildId)                      

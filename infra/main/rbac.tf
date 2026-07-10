@@ -11,7 +11,7 @@ resource "azurerm_role_assignment" "pipeline_sp" {
 }
 
 resource "azurerm_role_assignment" "deployer_network_contributor" {
-  scope                = azurerm_resource_group.main.id
+  scope                = azurerm_resource_group.rg_main.id
   role_definition_name = "Network Contributor"
   principal_id         = var.pipeline_sp_object_id
 }
